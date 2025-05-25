@@ -15,4 +15,5 @@ struct stat
     short type;  // Type of file
     short nlink; // Number of links to file
     uint64 size; // Size of file in bytes
+    int mode;  // File mode
 };

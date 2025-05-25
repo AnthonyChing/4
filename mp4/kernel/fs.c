@@ -20,6 +20,7 @@
 #include "fs.h"
 #include "buf.h"
 #include "file.h"
+#include "fcntl.h"
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
 // there should be one superblock per disk device, but we run with
@@ -207,6 +208,7 @@ struct inode *ialloc(uint dev, short type)
         { // a free inode
             memset(dip, 0, sizeof(*dip));
             dip->type = type;
+            dip->mode = M_ALL;
             log_write(bp); // mark it allocated on the disk
             brelse(bp);
             return iget(dev, inum);
@@ -233,6 +235,7 @@ void iupdate(struct inode *ip)
     dip->minor = ip->minor;
     dip->nlink = ip->nlink;
     dip->size = ip->size;
+    dip->mode = ip->mode;
     memmove(dip->addrs, ip->addrs, sizeof(ip->addrs));
     log_write(bp);
     brelse(bp);
@@ -307,6 +310,7 @@ void ilock(struct inode *ip)
         ip->minor = dip->minor;
         ip->nlink = dip->nlink;
         ip->size = dip->size;
+        ip->mode = dip->mode;
         memmove(ip->addrs, dip->addrs, sizeof(ip->addrs));
         brelse(bp);
         ip->valid = 1;
@@ -471,6 +475,7 @@ void stati(struct inode *ip, struct stat *st)
     st->type = ip->type;
     st->nlink = ip->nlink;
     st->size = ip->size;
+    st->mode = ip->mode;
 }
 
 // Read data from inode.
@@ -628,8 +633,10 @@ static char *skipelem(char *path, char *name)
 
     while (*path == '/')
         path++;
-    if (*path == 0)
+    if (*path == 0){
+        // printf("[skipelem] return 0\n");
         return 0;
+    }
     s = path;
     while (*path != '/' && *path != 0)
         path++;
@@ -643,6 +650,8 @@ static char *skipelem(char *path, char *name)
     }
     while (*path == '/')
         path++;
+    // printf("[skipelem] return path: %s\n", path);
+    // printf("[skipelem] name: %s\n", name);
     return path;
 }
 
@@ -686,6 +695,87 @@ static struct inode *namex(char *path, int nameiparent, char *name)
         iput(ip);
         return 0;
     }
+    return ip;
+}
+
+struct inode *mynamex(char *path, int omode, char *name)
+{
+    struct inode *ip, *next;
+
+    if (*path == '/')
+        ip = iget(ROOTDEV, ROOTINO);
+    else
+        ip = idup(myproc()->cwd);
+    // printf("[mynamex] Current ip: %d\n", ip->inum);
+    while ((path = skipelem(path, name)) != 0)
+    {
+        ilock(ip);
+        // printf("[mynamex] Checking if ip: %d is readable\n", ip->inum);
+        if(!(ip->mode & M_READ)){
+            // printf("[mynamex] ip: %d is not readable\n", ip->inum);
+            iunlockput(ip);
+            // printf("return 03\n");
+            return 0;
+        }
+        // printf("[mynamex] ip: %d is readable\n", ip->inum);
+        if(ip->type == T_SYMLINK){
+            char symlink_target[MAXPATH] = {0};
+            if (readi(ip, 0, (uint64)&symlink_target, 0, sizeof(symlink_target)) != sizeof(symlink_target))
+                // panic("mynamex: readi");
+            iunlockput(ip);
+            char sym_name[DIRSIZ] = {0};
+            // give omode as 0 because we want to resolve to the end
+            // printf("[mynamex] Tracing symlink, symlink target: %s\n", symlink_target);
+            if((ip = mynamex(symlink_target, 0, sym_name)) == 0){
+                return 0;
+            }
+            // printf("[mynamex] Return from tracing, got ip: %d\n", ip->inum);
+            ilock(ip);
+        }
+        if (ip->type == T_DIR)
+        {
+            // printf("name: %s, ip->inum: %d\n", name, ip->inum);
+            if ((next = dirlookup(ip, name, 0)) == 0)
+            {
+                iunlockput(ip);
+                // printf("return 02\n");
+                return 0;
+            }
+            iunlockput(ip);
+            ip = next;
+            // printf("[mynamex] Next ip->inum: %d\n", ip->inum);
+            // printf("name: %s, ip->inum: %d, after ip = next\n", name, ip->inum);
+            // printf("path: %s, path[0]: %d, path[1]: %d\n", path, path[0], path[1]);
+        }
+    }
+    // If O_NOACCESS is not set
+    if (!(omode & O_NOACCESS))
+    {
+        ilock(ip);
+        // printf("ip->type: %d, ip->mode: %d\n", ip->type, ip->mode);
+        while(ip->type == T_SYMLINK){
+            char symlink_target[MAXPATH];
+            if (readi(ip, 0, (uint64)&symlink_target, 0, sizeof(symlink_target)) != sizeof(symlink_target))
+                // panic("mynamex: readi");
+            // printf("mynamex: readi: %s\n", symlink_target);
+            iunlockput(ip);
+            char sym_name[DIRSIZ] = {0};
+            // give omode as 0 because none is needed
+            // printf("[mynamex] Final target is a symlink, symlink_target: %s\n", symlink_target);
+            if((ip = mynamex(symlink_target, 0, sym_name)) == 0){
+                return 0;
+            }
+            // printf("[mynamex] Resolved symlink from final target, got ip: %d\n", ip->inum);
+            ilock(ip);
+            if(!(ip->mode & M_READ)){
+                iunlockput(ip);
+                // printf("return 0\n");
+                return 0;
+            }
+        }
+        iunlock(ip);
+    }
+    // printf("[mynamex] return ip->inum: %d\n", ip->inum);
     return ip;
 }
 

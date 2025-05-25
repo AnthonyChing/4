@@ -25,7 +25,7 @@ int sleep(int);
 int uptime(void);
 /* TODO: Access Control & Symbolic Link */
 int symlink(const char *, const char *);
-
+int chmod(const char *, int);
 int force_fail(int pbn);
 int get_force_fail(void);
 int raw_read(int pbn, char *buf);

@@ -37,6 +37,8 @@ struct dinode
     short nlink;             // Number of links to inode in file system
     uint size;               // Size of file (bytes)
     uint addrs[NDIRECT + 1]; // Data block addresses
+    int mode;              // File mode
+    int trash[15]; // Padding to make the size of dinode 128 bytes
 };
 
 // Inodes per block.
@@ -59,3 +61,5 @@ struct dirent
     ushort inum;
     char name[DIRSIZ];
 };
+
+struct inode *mynamex(char *path, int omode, char *name);

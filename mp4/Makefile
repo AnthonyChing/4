@@ -133,6 +133,7 @@ UPROGS=\
 	$U/_mp4_2_mirror_test\
 	$U/_mp4_2_disk_failure_test\
 	$U/_mp4_2_write_failure_test\
+	$U/_chmod\
 	
 
 fs.img: mkfs/mkfs README $(UEXTRA) $(UPROGS)

@@ -34,6 +34,7 @@ struct inode
     short nlink;
     uint size;
     uint addrs[NDIRECT + 1];
+    int mode; // File mode
 };
 
 // map major device number to device functions.
