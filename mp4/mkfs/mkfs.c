@@ -246,6 +246,7 @@ uint ialloc(ushort type)
     din.type = xshort(type);
     din.nlink = xshort(1);
     din.size = xint(0);
+    din.mode = xshort(M_ALL);
     winode(inum, &din);
     return inum;
 }

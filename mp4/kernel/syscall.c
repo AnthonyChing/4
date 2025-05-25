@@ -107,6 +107,7 @@ extern uint64 sys_raw_write(void);
 extern uint64 sys_force_disk_fail(void);
 /* TODO: Access Control & Symbolic Link */
 extern uint64 sys_symlink(void);
+extern uint64 sys_chmod(void);
 
 static uint64 (*syscalls[])(void) = {
     [SYS_fork] sys_fork,
@@ -131,6 +132,7 @@ static uint64 (*syscalls[])(void) = {
     [SYS_mkdir] sys_mkdir,
     [SYS_close] sys_close,
     [SYS_symlink] sys_symlink,
+    [SYS_chmod] sys_chmod,
     [SYS_force_fail] sys_force_fail,
     [SYS_get_force_fail] sys_get_force_fail,
     [SYS_raw_read] sys_raw_read,

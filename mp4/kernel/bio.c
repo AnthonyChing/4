@@ -21,6 +21,7 @@
 #include "defs.h"
 #include "fs.h"
 #include "buf.h"
+#include "param.h"
 
 // Added: global variable added
 extern int force_read_error_pbn;
@@ -116,8 +117,17 @@ struct buf *bread(uint dev, uint blockno)
 
     if (!b->valid || is_forced_fail_target)
     {
-        virtio_disk_rw(b, 0);
-        b->valid = 1;
+        int pbn0 = b->blockno;  
+        if(force_disk_fail_id != 0 && force_read_error_pbn != pbn0){
+            virtio_disk_rw(b, 0);
+            b->valid = 1;
+        }
+        else{
+            b->blockno = b->blockno + DISK1_START_BLOCK; // Simulated second disk block number
+            virtio_disk_rw(b, 0);
+            b->valid = 1;
+            b->blockno = pbn0; // Change it back to PBN0
+        }
     }
     return b;
 }
@@ -128,7 +138,47 @@ void bwrite(struct buf *b)
 {
     if (!holdingsleep(&b->lock))
         panic("bwrite");
-    virtio_disk_rw(b, 1);
+
+    int pbn0 = b->blockno;
+    int pbn1 = b->blockno + DISK1_START_BLOCK; // Simulated second disk block number
+    int fail_disk = force_disk_fail_id;
+    int pbn0_fail_or_not = (pbn0 == force_read_error_pbn) ? 1 : 0;
+    printf(
+        "BW_DIAG: PBN0=%d, PBN1=%d, sim_disk_fail=%d, sim_pbn0_block_fail=%d\n",
+        pbn0, pbn1, fail_disk, pbn0_fail_or_not);
+    
+    if(fail_disk == 0){
+        printf(
+            "BW_ACTION: SKIP_PBN0 (PBN %d) due to simulated Disk 0 failure.\n",
+            pbn0);
+    }
+    else if(pbn0_fail_or_not == 1){
+        printf(
+            "BW_ACTION: SKIP_PBN0 (PBN %d) due to simulated PBN0 block "
+                "failure.\n",
+            pbn0);
+    }
+    else{
+        printf(
+            "BW_ACTION: ATTEMPT_PBN0 (PBN %d).\n",
+        pbn0);
+        b->blockno = pbn0; // Change block number to PBN0
+        virtio_disk_rw(b, 1);
+    }
+
+    if(fail_disk == 1){
+        printf(
+            "BW_ACTION: SKIP_PBN1 (PBN %d) due to simulated Disk 1 failure.\n",
+            pbn1);
+    }
+    else{
+        printf(
+            "BW_ACTION: ATTEMPT_PBN1 (PBN %d).\n",
+            pbn1);
+        b->blockno = pbn1; // Change block number to PBN1
+        virtio_disk_rw(b, 1);
+        b->blockno = pbn0; // Change it back to PBN0
+    }
 }
 
 // Release a locked buffer.

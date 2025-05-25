@@ -292,6 +292,7 @@ uint64 sys_open(void)
     struct file *f;
     struct inode *ip;
     int n;
+    char name[DIRSIZ];
 
     if ((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
         return -1;
@@ -309,13 +310,15 @@ uint64 sys_open(void)
     }
     else
     {
-        if ((ip = namei(path)) == 0)
+        if ((ip = mynamex(path, omode, name)) == 0)
         {
             end_op();
+            // printf("return -1\n");
             return -1;
         }
         ilock(ip);
-        if (ip->type == T_DIR && omode != O_RDONLY)
+        // Add all the allowed modes for dir access
+        if (ip->type == T_DIR && (omode != O_RDONLY && omode != O_NOACCESS && omode != (O_RDONLY | O_RESOLV) && omode != (O_NOACCESS | O_RESOLV)))
         {
             iunlockput(ip);
             end_op();
@@ -323,6 +326,27 @@ uint64 sys_open(void)
         }
     }
 
+    // If O_NOACCESS is not set and O_RESOLV is not set, check permissions
+    if(!(omode & O_NOACCESS) && !(omode & O_RESOLV)){
+        // Check read permission
+        if (!(omode & O_WRONLY)) { // If O_RDONLY or O_RDWR (i.e., read is intended)
+            if (!(ip->mode & M_READ)) {
+                iunlockput(ip);
+                end_op();
+                return -1; // Permission denied: read
+            }
+        }
+        
+        // Check write permission
+        if ((omode & O_WRONLY) || (omode & O_RDWR)) { // If O_WRONLY or O_RDWR (i.e., write is intended)
+            if (!(ip->mode & M_WRITE)) {
+                iunlockput(ip);
+                end_op();
+                return -1; // Permission denied: write
+            }
+        }
+    }
+    
     if (ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV))
     {
         iunlockput(ip);
@@ -350,8 +374,15 @@ uint64 sys_open(void)
         f->off = 0;
     }
     f->ip = ip;
-    f->readable = !(omode & O_WRONLY);
-    f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
+    // If O_NOACCESS is set, set readable and writable to 0
+    if(omode & O_NOACCESS){
+        f->readable = 0;
+        f->writable = 0;
+    }
+    else{
+        f->readable = !(omode & O_WRONLY);
+        f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
+    }
 
     if ((omode & O_TRUNC) && ip->type == T_FILE)
     {
@@ -509,19 +540,30 @@ uint64 sys_chmod(void)
 {
     /* just for your reference, change it if you want to */
 
-    // char path[MAXPATH];
-    // int mode;
-    // struct inode *ip;
+    char path[MAXPATH];
+    int mode;
+    struct inode *ip;
+    char name[DIRSIZ];
 
-    // begin_op();
-    // if (argstr(0, path, MAXPATH) < 0 || argint(1, &mode) < 0 ||
-    //     (ip = namei(path)) == 0)
-    // {
-    //     end_op();
-    //     return -1;
-    // }
-    // end_op();
+    begin_op();
+    if (argstr(0, path, MAXPATH) < 0 || argint(1, &mode) < 0)
+    {
+        end_op();
+        return -1;
+    }
 
+    ip = mynamex(path, 0, name);
+
+    ilock(ip); // Lock the inode.
+
+    // printf("[sys_chmod] Changing mode of %s (ip: %d) to %d\n", path, ip->inum, mode);
+    // Set the new mode, ensuring only M_READ and M_WRITE bits are considered.
+    ip->mode = mode & M_ALL;
+
+    iupdate(ip);    // Write inode changes to disk.
+    iunlockput(ip); // Unlock and release the inode.
+
+    end_op();
     return 0;
 }
 
@@ -530,11 +572,34 @@ uint64 sys_symlink(void)
 {
     /* just for your reference, change it if you want to */
 
-    // char target[MAXPATH], path[MAXPATH];
+    char target[MAXPATH], path[MAXPATH];
+    struct inode *ip;
+    int len;
 
-    // if (argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
-    //     return -1;
+    begin_op();
+    if (argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0 ||
+        (ip = create(path, T_SYMLINK, 0, 0)) == 0)
+    {
+        end_op();
+        return -1;
+    }
 
+    len = strlen(target);
+    target[len] = '\0'; // Ensure null termination
+    if (len > MAXPATH - 1) // Ensure target length is within bounds
+        len = MAXPATH - 1;
+    if (writei(ip, 0, (uint64)target, 0, len+1) != len+1) {
+        // Error writing to inode, or not all bytes written.
+        itrunc(ip); // Optional: clean up allocated blocks if write fails partially
+        ip->type = 0; // Mark inode as free if creation is to be fully rolled back
+        iupdate(ip);
+        iunlockput(ip); // Unlock and release the inode
+        end_op();
+        return -1;
+    }
+
+    iunlockput(ip);
+    end_op();
     return 0;
 }
 

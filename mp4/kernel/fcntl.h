@@ -4,3 +4,4 @@
 #define O_CREATE 0x200
 #define O_TRUNC 0x400
 #define O_NOACCESS 0x004
+#define O_RESOLV 0x008
