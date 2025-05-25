@@ -1,0 +1,935 @@
+diff --color -ruN --exclude=.git --exclude=.vscode mp4/Makefile mp4-new/Makefile
+--- mp4/Makefile	2025-05-16 03:36:55
++++ mp4-new/Makefile	2025-05-25 17:03:23
+@@ -133,6 +133,7 @@
+ 	$U/_mp4_2_mirror_test\
+ 	$U/_mp4_2_disk_failure_test\
+ 	$U/_mp4_2_write_failure_test\
++	$U/_chmod\
+ 	
+ 
+ fs.img: mkfs/mkfs README $(UEXTRA) $(UPROGS)
+diff --color -ruN --exclude=.git --exclude=.vscode mp4/kernel/bio.c mp4-new/kernel/bio.c
+--- mp4/kernel/bio.c	2025-05-16 03:36:55
++++ mp4-new/kernel/bio.c	2025-05-25 21:02:07
+@@ -21,6 +21,7 @@
+ #include "defs.h"
+ #include "fs.h"
+ #include "buf.h"
++#include "param.h"
+ 
+ // Added: global variable added
+ extern int force_read_error_pbn;
+@@ -116,8 +117,17 @@
+ 
+     if (!b->valid || is_forced_fail_target)
+     {
+-        virtio_disk_rw(b, 0);
+-        b->valid = 1;
++        int pbn0 = b->blockno;  
++        if(force_disk_fail_id != 0 && force_read_error_pbn != pbn0){
++            virtio_disk_rw(b, 0);
++            b->valid = 1;
++        }
++        else{
++            b->blockno = b->blockno + DISK1_START_BLOCK; // Simulated second disk block number
++            virtio_disk_rw(b, 0);
++            b->valid = 1;
++            b->blockno = pbn0; // Change it back to PBN0
++        }
+     }
+     return b;
+ }
+@@ -128,7 +138,47 @@
+ {
+     if (!holdingsleep(&b->lock))
+         panic("bwrite");
+-    virtio_disk_rw(b, 1);
++
++    int pbn0 = b->blockno;
++    int pbn1 = b->blockno + DISK1_START_BLOCK; // Simulated second disk block number
++    int fail_disk = force_disk_fail_id;
++    int pbn0_fail_or_not = (pbn0 == force_read_error_pbn) ? 1 : 0;
++    printf(
++        "BW_DIAG: PBN0=%d, PBN1=%d, sim_disk_fail=%d, sim_pbn0_block_fail=%d\n",
++        pbn0, pbn1, fail_disk, pbn0_fail_or_not);
++    
++    if(fail_disk == 0){
++        printf(
++            "BW_ACTION: SKIP_PBN0 (PBN %d) due to simulated Disk 0 failure.\n",
++            pbn0);
++    }
++    else if(pbn0_fail_or_not == 1){
++        printf(
++            "BW_ACTION: SKIP_PBN0 (PBN %d) due to simulated PBN0 block "
++                "failure.\n",
++            pbn0);
++    }
++    else{
++        printf(
++            "BW_ACTION: ATTEMPT_PBN0 (PBN %d).\n",
++        pbn0);
++        b->blockno = pbn0; // Change block number to PBN0
++        virtio_disk_rw(b, 1);
++    }
++
++    if(fail_disk == 1){
++        printf(
++            "BW_ACTION: SKIP_PBN1 (PBN %d) due to simulated Disk 1 failure.\n",
++            pbn1);
++    }
++    else{
++        printf(
++            "BW_ACTION: ATTEMPT_PBN1 (PBN %d).\n",
++            pbn1);
++        b->blockno = pbn1; // Change block number to PBN1
++        virtio_disk_rw(b, 1);
++        b->blockno = pbn0; // Change it back to PBN0
++    }
+ }
+ 
+ // Release a locked buffer.
+diff --color -ruN --exclude=.git --exclude=.vscode mp4/kernel/fcntl.h mp4-new/kernel/fcntl.h
+--- mp4/kernel/fcntl.h	2025-05-16 03:36:55
++++ mp4-new/kernel/fcntl.h	2025-05-25 17:03:23
+@@ -4,3 +4,4 @@
+ #define O_CREATE 0x200
+ #define O_TRUNC 0x400
+ #define O_NOACCESS 0x004
++#define O_RESOLV 0x008
+\ No newline at end of file
+diff --color -ruN --exclude=.git --exclude=.vscode mp4/kernel/file.h mp4-new/kernel/file.h
+--- mp4/kernel/file.h	2025-05-16 03:36:55
++++ mp4-new/kernel/file.h	2025-05-25 17:03:23
+@@ -34,6 +34,7 @@
+     short nlink;
+     uint size;
+     uint addrs[NDIRECT + 1];
++    int mode; // File mode
+ };
+ 
+ // map major device number to device functions.
+diff --color -ruN --exclude=.git --exclude=.vscode mp4/kernel/fs.c mp4-new/kernel/fs.c
+--- mp4/kernel/fs.c	2025-05-16 03:36:55
++++ mp4-new/kernel/fs.c	2025-05-25 17:03:23
+@@ -20,6 +20,7 @@
+ #include "fs.h"
+ #include "buf.h"
+ #include "file.h"
++#include "fcntl.h"
+ 
+ #define min(a, b) ((a) < (b) ? (a) : (b))
+ // there should be one superblock per disk device, but we run with
+@@ -207,6 +208,7 @@
+         { // a free inode
+             memset(dip, 0, sizeof(*dip));
+             dip->type = type;
++            dip->mode = M_ALL;
+             log_write(bp); // mark it allocated on the disk
+             brelse(bp);
+             return iget(dev, inum);
+@@ -233,6 +235,7 @@
+     dip->minor = ip->minor;
+     dip->nlink = ip->nlink;
+     dip->size = ip->size;
++    dip->mode = ip->mode;
+     memmove(dip->addrs, ip->addrs, sizeof(ip->addrs));
+     log_write(bp);
+     brelse(bp);
+@@ -307,6 +310,7 @@
+         ip->minor = dip->minor;
+         ip->nlink = dip->nlink;
+         ip->size = dip->size;
++        ip->mode = dip->mode;
+         memmove(ip->addrs, dip->addrs, sizeof(ip->addrs));
+         brelse(bp);
+         ip->valid = 1;
+@@ -471,6 +475,7 @@
+     st->type = ip->type;
+     st->nlink = ip->nlink;
+     st->size = ip->size;
++    st->mode = ip->mode;
+ }
+ 
+ // Read data from inode.
+@@ -628,8 +633,10 @@
+ 
+     while (*path == '/')
+         path++;
+-    if (*path == 0)
++    if (*path == 0){
++        // printf("[skipelem] return 0\n");
+         return 0;
++    }
+     s = path;
+     while (*path != '/' && *path != 0)
+         path++;
+@@ -643,6 +650,8 @@
+     }
+     while (*path == '/')
+         path++;
++    // printf("[skipelem] return path: %s\n", path);
++    // printf("[skipelem] name: %s\n", name);
+     return path;
+ }
+ 
+@@ -686,6 +695,87 @@
+         iput(ip);
+         return 0;
+     }
++    return ip;
++}
++
++struct inode *mynamex(char *path, int omode, char *name)
++{
++    struct inode *ip, *next;
++
++    if (*path == '/')
++        ip = iget(ROOTDEV, ROOTINO);
++    else
++        ip = idup(myproc()->cwd);
++    // printf("[mynamex] Current ip: %d\n", ip->inum);
++    while ((path = skipelem(path, name)) != 0)
++    {
++        ilock(ip);
++        // printf("[mynamex] Checking if ip: %d is readable\n", ip->inum);
++        if(!(ip->mode & M_READ)){
++            // printf("[mynamex] ip: %d is not readable\n", ip->inum);
++            iunlockput(ip);
++            // printf("return 03\n");
++            return 0;
++        }
++        // printf("[mynamex] ip: %d is readable\n", ip->inum);
++        if(ip->type == T_SYMLINK){
++            char symlink_target[MAXPATH] = {0};
++            if (readi(ip, 0, (uint64)&symlink_target, 0, sizeof(symlink_target)) != sizeof(symlink_target))
++                // panic("mynamex: readi");
++            iunlockput(ip);
++            char sym_name[DIRSIZ] = {0};
++            // give omode as 0 because we want to resolve to the end
++            // printf("[mynamex] Tracing symlink, symlink target: %s\n", symlink_target);
++            if((ip = mynamex(symlink_target, 0, sym_name)) == 0){
++                return 0;
++            }
++            // printf("[mynamex] Return from tracing, got ip: %d\n", ip->inum);
++            ilock(ip);
++        }
++        if (ip->type == T_DIR)
++        {
++            // printf("name: %s, ip->inum: %d\n", name, ip->inum);
++            if ((next = dirlookup(ip, name, 0)) == 0)
++            {
++                iunlockput(ip);
++                // printf("return 02\n");
++                return 0;
++            }
++            iunlockput(ip);
++            ip = next;
++            // printf("[mynamex] Next ip->inum: %d\n", ip->inum);
++            // printf("name: %s, ip->inum: %d, after ip = next\n", name, ip->inum);
++            // printf("path: %s, path[0]: %d, path[1]: %d\n", path, path[0], path[1]);
++        }
++    }
++    // If O_NOACCESS is not set
++    if (!(omode & O_NOACCESS))
++    {
++        ilock(ip);
++        // printf("ip->type: %d, ip->mode: %d\n", ip->type, ip->mode);
++        while(ip->type == T_SYMLINK){
++            char symlink_target[MAXPATH];
++            if (readi(ip, 0, (uint64)&symlink_target, 0, sizeof(symlink_target)) != sizeof(symlink_target))
++                // panic("mynamex: readi");
++            // printf("mynamex: readi: %s\n", symlink_target);
++            iunlockput(ip);
++            char sym_name[DIRSIZ] = {0};
++            // give omode as 0 because none is needed
++            // printf("[mynamex] Final target is a symlink, symlink_target: %s\n", symlink_target);
++            if((ip = mynamex(symlink_target, 0, sym_name)) == 0){
++                return 0;
++            }
++            // printf("[mynamex] Resolved symlink from final target, got ip: %d\n", ip->inum);
++            ilock(ip);
++            if(!(ip->mode & M_READ)){
++                iunlockput(ip);
++                // printf("return 0\n");
++                return 0;
++            }
++        }
++        iunlock(ip);
++    }
++    // printf("[mynamex] return ip->inum: %d\n", ip->inum);
+     return ip;
+ }
+ 
+diff --color -ruN --exclude=.git --exclude=.vscode mp4/kernel/fs.h mp4-new/kernel/fs.h
+--- mp4/kernel/fs.h	2025-05-16 03:36:55
++++ mp4-new/kernel/fs.h	2025-05-25 17:03:23
+@@ -31,7 +31,8 @@
+ // On-disk inode structure
+ struct dinode
+ {
+-    short type;              // File type
++    char type;              // File type
++    char mode;              // File mode
+     short major;             // Major device number (T_DEVICE only)
+     short minor;             // Minor device number (T_DEVICE only)
+     short nlink;             // Number of links to inode in file system
+@@ -59,3 +60,5 @@
+     ushort inum;
+     char name[DIRSIZ];
+ };
++
++struct inode *mynamex(char *path, int omode, char *name);
+\ No newline at end of file
+diff --color -ruN --exclude=.git --exclude=.vscode mp4/kernel/stat.h mp4-new/kernel/stat.h
+--- mp4/kernel/stat.h	2025-05-16 03:36:55
++++ mp4-new/kernel/stat.h	2025-05-25 17:03:23
+@@ -15,4 +15,5 @@
+     short type;  // Type of file
+     short nlink; // Number of links to file
+     uint64 size; // Size of file in bytes
++    int mode;  // File mode
+ };
+diff --color -ruN --exclude=.git --exclude=.vscode mp4/kernel/syscall.c mp4-new/kernel/syscall.c
+--- mp4/kernel/syscall.c	2025-05-16 03:36:55
++++ mp4-new/kernel/syscall.c	2025-05-25 17:03:23
+@@ -107,6 +107,7 @@
+ extern uint64 sys_force_disk_fail(void);
+ /* TODO: Access Control & Symbolic Link */
+ extern uint64 sys_symlink(void);
++extern uint64 sys_chmod(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+     [SYS_fork] sys_fork,
+@@ -131,6 +132,7 @@
+     [SYS_mkdir] sys_mkdir,
+     [SYS_close] sys_close,
+     [SYS_symlink] sys_symlink,
++    [SYS_chmod] sys_chmod,
+     [SYS_force_fail] sys_force_fail,
+     [SYS_get_force_fail] sys_get_force_fail,
+     [SYS_raw_read] sys_raw_read,
+diff --color -ruN --exclude=.git --exclude=.vscode mp4/kernel/syscall.h mp4-new/kernel/syscall.h
+--- mp4/kernel/syscall.h	2025-05-16 03:36:55
++++ mp4-new/kernel/syscall.h	2025-05-25 17:03:23
+@@ -28,5 +28,5 @@
+ #define SYS_force_disk_fail 27
+ 
+ /* TODO: Access Control & Symbolic Link */
+-// #define SYS_chmod 28
+-#define SYS_symlink 29
++#define SYS_symlink 28
++#define SYS_chmod 29
+diff --color -ruN --exclude=.git --exclude=.vscode mp4/kernel/sysfile.c mp4-new/kernel/sysfile.c
+--- mp4/kernel/sysfile.c	2025-05-16 03:36:55
++++ mp4-new/kernel/sysfile.c	2025-05-25 17:03:23
+@@ -292,6 +292,7 @@
+     struct file *f;
+     struct inode *ip;
+     int n;
++    char name[DIRSIZ];
+ 
+     if ((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
+         return -1;
+@@ -309,13 +310,15 @@
+     }
+     else
+     {
+-        if ((ip = namei(path)) == 0)
++        if ((ip = mynamex(path, omode, name)) == 0)
+         {
+             end_op();
++            // printf("return -1\n");
+             return -1;
+         }
+         ilock(ip);
+-        if (ip->type == T_DIR && omode != O_RDONLY)
++        // Add all the allowed modes for dir access
++        if (ip->type == T_DIR && (omode != O_RDONLY && omode != O_NOACCESS && omode != (O_RDONLY | O_RESOLV) && omode != (O_NOACCESS | O_RESOLV)))
+         {
+             iunlockput(ip);
+             end_op();
+@@ -323,6 +326,27 @@
+         }
+     }
+ 
++    // If O_NOACCESS is not set and O_RESOLV is not set, check permissions
++    if(!(omode & O_NOACCESS) && !(omode & O_RESOLV)){
++        // Check read permission
++        if (!(omode & O_WRONLY)) { // If O_RDONLY or O_RDWR (i.e., read is intended)
++            if (!(ip->mode & M_READ)) {
++                iunlockput(ip);
++                end_op();
++                return -1; // Permission denied: read
++            }
++        }
++        
++        // Check write permission
++        if ((omode & O_WRONLY) || (omode & O_RDWR)) { // If O_WRONLY or O_RDWR (i.e., write is intended)
++            if (!(ip->mode & M_WRITE)) {
++                iunlockput(ip);
++                end_op();
++                return -1; // Permission denied: write
++            }
++        }
++    }
++    
+     if (ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV))
+     {
+         iunlockput(ip);
+@@ -350,8 +374,15 @@
+         f->off = 0;
+     }
+     f->ip = ip;
+-    f->readable = !(omode & O_WRONLY);
+-    f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
++    // If O_NOACCESS is set, set readable and writable to 0
++    if(omode & O_NOACCESS){
++        f->readable = 0;
++        f->writable = 0;
++    }
++    else{
++        f->readable = !(omode & O_WRONLY);
++        f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
++    }
+ 
+     if ((omode & O_TRUNC) && ip->type == T_FILE)
+     {
+@@ -509,19 +540,30 @@
+ {
+     /* just for your reference, change it if you want to */
+ 
+-    // char path[MAXPATH];
+-    // int mode;
+-    // struct inode *ip;
++    char path[MAXPATH];
++    int mode;
++    struct inode *ip;
++    char name[DIRSIZ];
+ 
+-    // begin_op();
+-    // if (argstr(0, path, MAXPATH) < 0 || argint(1, &mode) < 0 ||
+-    //     (ip = namei(path)) == 0)
+-    // {
+-    //     end_op();
+-    //     return -1;
+-    // }
+-    // end_op();
++    begin_op();
++    if (argstr(0, path, MAXPATH) < 0 || argint(1, &mode) < 0)
++    {
++        end_op();
++        return -1;
++    }
+ 
++    ip = mynamex(path, 0, name);
++
++    ilock(ip); // Lock the inode.
++
++    // printf("[sys_chmod] Changing mode of %s (ip: %d) to %d\n", path, ip->inum, mode);
++    // Set the new mode, ensuring only M_READ and M_WRITE bits are considered.
++    ip->mode = mode & M_ALL;
++
++    iupdate(ip);    // Write inode changes to disk.
++    iunlockput(ip); // Unlock and release the inode.
++
++    end_op();
+     return 0;
+ }
+ 
+@@ -530,11 +572,34 @@
+ {
+     /* just for your reference, change it if you want to */
+ 
+-    // char target[MAXPATH], path[MAXPATH];
++    char target[MAXPATH], path[MAXPATH];
++    struct inode *ip;
++    int len;
+ 
+-    // if (argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+-    //     return -1;
++    begin_op();
++    if (argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0 ||
++        (ip = create(path, T_SYMLINK, 0, 0)) == 0)
++    {
++        end_op();
++        return -1;
++    }
+ 
++    len = strlen(target);
++    target[len] = '\0'; // Ensure null termination
++    if (len > MAXPATH - 1) // Ensure target length is within bounds
++        len = MAXPATH - 1;
++    if (writei(ip, 0, (uint64)target, 0, len+1) != len+1) {
++        // Error writing to inode, or not all bytes written.
++        itrunc(ip); // Optional: clean up allocated blocks if write fails partially
++        ip->type = 0; // Mark inode as free if creation is to be fully rolled back
++        iupdate(ip);
++        iunlockput(ip); // Unlock and release the inode
++        end_op();
++        return -1;
++    }
++
++    iunlockput(ip);
++    end_op();
+     return 0;
+ }
+ 
+diff --color -ruN --exclude=.git --exclude=.vscode mp4/mkfs/mkfs.c mp4-new/mkfs/mkfs.c
+--- mp4/mkfs/mkfs.c	2025-05-16 03:36:55
++++ mp4-new/mkfs/mkfs.c	2025-05-25 17:03:23
+@@ -246,6 +246,7 @@
+     din.type = xshort(type);
+     din.nlink = xshort(1);
+     din.size = xint(0);
++    din.mode = xshort(M_ALL);
+     winode(inum, &din);
+     return inum;
+ }
+diff --color -ruN --exclude=.git --exclude=.vscode mp4/user/chmod.c mp4-new/user/chmod.c
+--- mp4/user/chmod.c	1970-01-01 08:00:00
++++ mp4-new/user/chmod.c	2025-05-25 17:03:23
+@@ -0,0 +1,251 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fcntl.h"
++#include "kernel/param.h"
++#include "kernel/fs.h"
++
++int chmod_recursive(char *path, int mode, int operation, int post_order);
++
++// Open the directory and read all entries. chmod path/entry for all entries
++void chmod_dir(char *path, int mode, int operation, int post_order){
++    int fd, new_mode;
++    struct stat st;
++    char buf[512] = {0}; // Buffer to read directory entries
++    char *p;
++
++    // Open the directory
++    if((fd = open(path, O_RESOLV)) < 0){
++        fprintf(2, "chmod: cannot chmod %s\n", path);
++        exit(1);
++    }
++    if (fstat(fd, &st) < 0)
++    {
++        fprintf(2, "chmod: cannot chmod %s\n", path);
++        close(fd);
++        exit(1);
++    }
++    close(fd);
++
++    strcpy(buf, path);
++    p = buf + strlen(buf);
++    *p++ = '/';
++    struct dirent de;
++
++    if (operation == 1) // '+', add mode
++        new_mode = st.mode | mode;
++    else // '-', remove mode
++        new_mode = st.mode & ~mode;
++    
++    if(post_order==0){
++        chmod(path, new_mode);
++    }
++    if((fd = open(path, O_RDONLY)) < 0){
++        fprintf(2, "chmod: cannot chmod %s\n", path);
++        exit(1);
++    }
++    while(read(fd, &de, sizeof(de)) == sizeof(de)){
++        if (de.inum == 0)
++            continue; // Skip empty entries
++        if(de.name[0] == '.' && (de.name[1] == '\0' || (de.name[1] == '.' && de.name[2] == '\0')))
++            continue; // Skip '.' and '..' entries
++        memmove(p, de.name, DIRSIZ);
++        p[DIRSIZ] = 0; // Null-terminate the path
++        if (post_order) {
++            // Recursively chmod the entry first
++            chmod_recursive(buf, mode, operation, post_order);
++        } else {
++            // Change the mode of the entry directly
++            chmod_recursive(buf, mode, operation, post_order);
++        }
++    }
++    close(fd);
++    if(post_order==1){
++        chmod(path, new_mode);
++    }
++}
++
++int chmod_recursive(char *path, int mode, int operation, int post_order){
++    int fd, new_mode;
++    struct stat st;
++    // Check all parent directories' read permissions
++    if((fd = open(path, O_NOACCESS)) < 0){
++        fprintf(2, "chmod: cannot chmod %s\n", path, fd);
++        exit(1);
++    }
++
++    if (fstat(fd, &st) < 0)
++    {
++        fprintf(2, "chmod: cannot chmod %s\n", path);
++        close(fd);
++        exit(1);
++    }
++    close(fd);
++
++    if(st.type == T_FILE){ // If it's a file, change the mode directly
++        if (operation == 1) // '+', add mode
++            new_mode = st.mode | mode;
++        else // '-', remove mode
++            new_mode = st.mode & ~mode;
++        // omode flag doesn't matter because file type is file or directory
++        chmod(path, new_mode);
++    }
++    else if(st.type == T_SYMLINK){
++        // If it's a symbolic link, open it with O_RESOLV to resolve the link
++        if((fd = open(path, O_RESOLV)) < 0){
++            fprintf(2, "chmod: cannot chmod %s\n", path);
++            exit(1);
++        }
++        if (fstat(fd, &st) < 0)
++        {
++            fprintf(2, "chmod: cannot chmod %s\n", path);
++            close(fd);
++            exit(1);
++        }
++        close(fd);
++        if(st.type == T_FILE){
++            if(operation == 1) // '+', add mode
++                new_mode = st.mode | mode;
++            else // '-', remove mode
++                new_mode = st.mode & ~mode;
++            chmod(path, new_mode);
++        }
++        else if(st.type == T_DIR){
++            chmod_dir(path, mode, operation, post_order);
++        }
++    }
++    else if(st.type == T_DIR){ // If it's a directory, recursively chmod all entries
++        chmod_dir(path, mode, operation, post_order);
++    }
++    else{
++        fprintf(2, "chmod: cannot chmod %s\n", path);
++        exit(1);
++    }
++
++    return 0;
++}
++
++int main(int argc, char *argv[])
++{
++    char path[MAXPATH];
++    int mode;
++    int new_mode;
++    int operation;
++    int recursive;
++    int post_order; // 1 for post-order traversal, 0 for pre-order traversal
++    struct stat st;
++    int fd;
++    if (argc < 3){
++        fprintf(2, "Usage: chmod [-R] (+|-)(r|w|rw|wr) file_name|dir_name\n");
++        exit(1);
++    }
++    if (argv[1][0] == '-' && argv[1][1] == 'R'){
++        recursive = 1;
++        if (argc < 4){
++            fprintf(2, "Usage: chmod [-R] (+|-)(r|w|rw|wr) file_name|dir_name\n");
++            exit(1);
++        }
++        strcpy(argv[1], argv[2]);
++        strcpy(argv[2], argv[3]);
++    }
++    else{
++        recursive = 0;
++    }
++    if(argv[1][0] == '+' && argv[1][1] == 'r' && argv[1][2] == '\0'){
++        mode = M_READ;
++        operation = 1;
++    }
++    else if(argv[1][0] == '+' && argv[1][1] == 'w' && argv[1][2] == '\0'){
++        mode = M_WRITE;
++        operation = 1;
++    }
++    else if(argv[1][0] == '+' && argv[1][1] == 'r' && argv[1][2] == 'w' && argv[1][3] == '\0'){
++        mode = M_ALL;
++        operation = 1;
++    }
++    else if(argv[1][0] == '+' && argv[1][1] == 'w' && argv[1][2] == 'r' && argv[1][3] == '\0'){
++        mode = M_ALL;
++        operation = 1;
++    }
++    else if(argv[1][0] == '-' && argv[1][1] == 'r' && argv[1][2] == '\0'){
++        mode = M_READ;
++        operation = 0;
++    }
++    else if(argv[1][0] == '-' && argv[1][1] == 'w' && argv[1][2] == '\0'){
++        mode = M_WRITE;
++        operation = 0;
++    }
++    else if(argv[1][0] == '-' && argv[1][1] == 'r' && argv[1][2] == 'w' && argv[1][3] == '\0'){
++        mode = M_ALL;
++        operation = 0;
++    }
++    else if(argv[1][0] == '-' && argv[1][1] == 'w' && argv[1][2] == 'r' && argv[1][3] == '\0'){
++        mode = M_ALL;
++        operation = 0;
++    }
++    else{
++        fprintf(2, "Usage: chmod [-R] (+|-)(r|w|rw|wr) file_name|dir_name\n");
++        exit(1);
++    }
++    strcpy(path, argv[2]);
++
++    if(recursive == 1 && operation == 0 && (mode == M_READ || mode == M_ALL)){
++        post_order = 1; // Post-order traversal
++    }
++    else{
++        post_order = 0; // Pre-order traversal
++    }
++
++    if((fd = open(path, O_NOACCESS)) < 0){
++        fprintf(2, "chmod: cannot chmod %s\n", path, fd);
++        exit(1);
++    }
++
++    if (fstat(fd, &st) < 0)
++    {
++        fprintf(2, "chmod: cannot chmod %s\n", path);
++        close(fd);
++        exit(1);
++    }
++    close(fd);
++
++    if(recursive == 1){
++        chmod_recursive(path, mode, operation, post_order);
++    }
++    else{
++        // If it's a file or a directory, change the mode directly
++        // If it's a symbolic link, call open with O_RESOLV and then change the mode directly
++        if(st.type == T_FILE || st.type == T_DIR){
++            if (operation == 1) // '+', add mode
++                new_mode = st.mode | mode;
++            else // '-', remove mode
++                new_mode = st.mode & ~mode;
++            // omode flag doesn't matter because file type is file or directory
++            chmod(path, new_mode);
++        }
++        else if(st.type == T_SYMLINK){
++            // If it's a symbolic link, open it with O_RESOLV to resolve the link
++            if((fd = open(path, O_RESOLV)) < 0){
++                fprintf(2, "chmod: cannot chmod %s\n", path);
++                exit(1);
++            }
++            if (fstat(fd, &st) < 0)
++            {
++                fprintf(2, "chmod: cannot chmod %s\n", path);
++                close(fd);
++                exit(1);
++            }
++            close(fd);
++            if (operation == 1) // '+', add mode
++                new_mode = st.mode | mode;
++            else // '-', remove mode
++                new_mode = st.mode & ~mode;
++            chmod(path, new_mode);
++        }
++        else{
++            fprintf(2, "chmod: cannot chmod %s\n", path);
++            exit(1);
++        }
++    }
++    exit(0);
++}
+diff --color -ruN --exclude=.git --exclude=.vscode mp4/user/ls.c mp4-new/user/ls.c
+--- mp4/user/ls.c	2025-05-16 03:36:55
++++ mp4-new/user/ls.c	2025-05-25 17:03:23
+@@ -2,7 +2,22 @@
+ #include "kernel/stat.h"
+ #include "user/user.h"
+ #include "kernel/fs.h"
++#include "kernel/param.h"
++#include "kernel/fcntl.h"
+ 
++void mode_to_string(char *mode, int m)
++{
++    if (m == M_READ)
++        strcpy(mode, "r-");
++    else if (m == M_WRITE)
++        strcpy(mode, "-w");
++    else if (m == M_ALL)
++        strcpy(mode, "rw");
++    else
++        strcpy(mode, "--");
++    return;
++}
++
+ char *fmtname(char *path)
+ {
+     static char buf[DIRSIZ + 1];
+@@ -21,15 +36,48 @@
+     return buf;
+ }
+ 
++void read_dir(int fd, char *mode, char *buf, char *path){
++    char *p;
++    strcpy(buf, path);
++    p = buf + strlen(buf);
++    *p++ = '/';
++    struct dirent de;
++    while (read(fd, &de, sizeof(de)) == sizeof(de)){
++        if (de.inum == 0)
++            continue;
++        memmove(p, de.name, DIRSIZ);
++        p[DIRSIZ] = 0;
++        int file_fd;
++        // Should use O_NOACCESS, because the permissions of the file doesn't matter and we don't want to follow any symlinks
++        // printf("[read_dir] Reading %s\n", buf);
++        if((file_fd = open(buf, O_NOACCESS)) < 0){
++            printf("ls: cannot open %s\n", buf);
++            close(fd);
++            return;
++        }
++        struct stat file_st;
++        if (fstat(file_fd, &file_st) < 0)
++        {
++            printf("ls: cannot stat %s\n", buf);
++            close(file_fd);
++            return;
++        }
++        close(file_fd);
++        // printf("[read_dir] File type: %d, Inode: %d, Size: %d\n", file_st.type, file_st.ino, file_st.size);
++        mode_to_string(mode, file_st.mode);
++        printf("%s %d %d %d %s\n", fmtname(buf), file_st.type, file_st.ino, file_st.size, mode);
++    }
++    return;
++}
++
+ /* TODO: Access Control & Symbolic Link */
+ void ls(char *path)
+ {
+-    char buf[512], *p;
++    char buf[512];
+     int fd;
+-    struct dirent de;
+     struct stat st;
+ 
+-    if ((fd = open(path, 0)) < 0)
++    if ((fd = open(path, O_NOACCESS)) < 0)
+     {
+         fprintf(2, "ls: cannot open %s\n", path);
+         return;
+@@ -41,39 +89,71 @@
+         close(fd);
+         return;
+     }
+-
++    close(fd);
++    char mode[3];
+     switch (st.type)
+     {
+     case T_FILE:
+-        printf("%s %d %d %l\n", fmtname(path), st.type, st.ino, st.size);
+-        break;
++        if ((fd = open(path, O_RDONLY)) < 0)
++        {
++            fprintf(2, "ls: cannot open %s\n", path);
++            return;
++        }
+ 
+-    case T_DIR:
+-        if (strlen(path) + 1 + DIRSIZ + 1 > sizeof buf)
++        if (fstat(fd, &st) < 0)
+         {
+-            printf("ls: path too long\n");
+-            break;
++            fprintf(2, "ls: cannot stat %s\n", path);
++            close(fd);
++            return;
+         }
+-        strcpy(buf, path);
+-        p = buf + strlen(buf);
+-        *p++ = '/';
+-        while (read(fd, &de, sizeof(de)) == sizeof(de))
++        close(fd);
++        mode_to_string(mode, st.mode);
++        printf("%s %d %d %l %s\n", fmtname(path), st.type, st.ino, st.size, mode);
++        return;
++
++    case T_DIR:
++        if((fd = open(path, O_RDONLY)) < 0){
++            printf("ls: cannot open %s\n", path);
++            close(fd);
++            return;
++        }
++        read_dir(fd, mode, buf, path);
++        close(fd);
++        return;
++
++    case T_SYMLINK:
++        // printf("[ls] %s is a symbolic link\n", path);
++        if((fd = open(path, O_RESOLV)) < 0){
++            printf("ls: cannot open %s\n", path);
++            close(fd);
++            return;
++        }
++        struct stat st_symlink;
++        if (fstat(fd, &st_symlink) < 0)
+         {
+-            if (de.inum == 0)
+-                continue;
+-            memmove(p, de.name, DIRSIZ);
+-            p[DIRSIZ] = 0;
+-            if (stat(buf, &st) < 0)
+-            {
+-                printf("ls: cannot stat %s\n", buf);
+-                continue;
++            printf("ls: cannot stat %s\n", path);
++            close(fd);
++            return;
++        }
++        close(fd);
++        if(st_symlink.type == T_FILE){
++            mode_to_string(mode, st.mode);
++            printf("%s %d %d %d %s\n", fmtname(path), st.type, st.ino, st.size, mode);
++        }
++        else if(st_symlink.type == T_DIR){
++            // printf("[ls] %s points to a directory, reading contents...\n", path);
++            if((fd = open(path, O_RDONLY)) < 0){
++                printf("ls: cannot open %s\n", path);
++                close(fd);
++                return;
+             }
+-            printf("%s %d %d %d\n", fmtname(buf), st.type, st.ino, st.size);
++            read_dir(fd, mode, buf, path);
++            close(fd);
+         }
+-        break;
++        return;
+     }
+ 
+-    close(fd);
++    return;
+ }
+ 
+ int main(int argc, char *argv[])
+diff --color -ruN --exclude=.git --exclude=.vscode mp4/user/user.h mp4-new/user/user.h
+--- mp4/user/user.h	2025-05-16 03:36:55
++++ mp4-new/user/user.h	2025-05-25 17:03:23
+@@ -25,7 +25,7 @@
+ int uptime(void);
+ /* TODO: Access Control & Symbolic Link */
+ int symlink(const char *, const char *);
+-
++int chmod(const char *, int);
+ int force_fail(int pbn);
+ int get_force_fail(void);
+ int raw_read(int pbn, char *buf);
+diff --color -ruN --exclude=.git --exclude=.vscode mp4/user/usys.pl mp4-new/user/usys.pl
+--- mp4/user/usys.pl	2025-05-16 03:36:55
++++ mp4-new/user/usys.pl	2025-05-25 17:03:23
+@@ -45,3 +45,4 @@
+ entry("force_disk_fail");
+ # TODO: Access Control
+ entry("symlink");
++entry("chmod");
